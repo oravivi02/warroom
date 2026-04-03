@@ -12,38 +12,12 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 # ==========================================
 # ⚙️ קונפיגורציה והגדרות גלובליות
 # ==========================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MAPTILER_KEY = os.getenv("MAPTILER_KEY", "1ZewpyCj7brOgryKeolM").strip()
 MAPBOX_STYLE = f"https://api.maptiler.com/maps/streets-v4/style.json?key={MAPTILER_KEY}"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
-
-_gemini_client = None
-_gemini_model = None
-
-genai_new = None
-genai_old = None
-try:
-    import google.genai as genai_new
-except ImportError:
-    try:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            import google.generativeai as genai_old
-    except ImportError:
-        pass
-
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_KEY":
-    if genai_new is not None:
-        _gemini_client = genai_new.Client(api_key=GEMINI_API_KEY)
-    elif genai_old is not None:
-        genai_old.configure(api_key=GEMINI_API_KEY)
-        _gemini_model = genai_old.GenerativeModel(GEMINI_MODEL)
 
 # בסיס נתונים של ערים מרכזיות בישראל
 CITY_COORDINATES = {
@@ -169,17 +143,6 @@ def add_to_history(event: dict):
 # ==========================================
 # 🗺️ כלי גיאוגרפיה
 # ==========================================
-def is_within_israel(lat: float, lng: float) -> bool:
-    return 29.0 <= lat <= 34.0 and 34.0 <= lng <= 36.0
-
-def extract_city_from_text(text: str) -> Optional[tuple]:
-    if not text:
-        return None
-    for city, (lat, lng) in CITY_COORDINATES.items():
-        if city in text:
-            return (lat, lng)
-    return None
-
 DEFAULT_CITY_COORDINATES = (32.0853, 34.7818)
 GEOCODE_CACHE: dict = {}
 GEOCODE_CACHE_PATH = os.path.join(os.path.dirname(__file__), "city_coords_cache.json")
@@ -322,57 +285,6 @@ def get_area_polygon(cities: list) -> Optional[list]:
     ]
 
 # ==========================================
-# 🧠 מנוע עיבוד המידע
-# ==========================================
-class WarEvent(BaseModel):
-    id: str
-    text: str
-    lat: float
-    lng: float
-    type: str
-    reliability: float
-    timestamp: float
-    origin_lat: float | None = None
-    origin_lng: float | None = None
-    target_lat: float | None = None
-    target_lng: float | None = None
-
-async def process_raw_intel(raw_text: str, source_type: str):
-    if not (GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_KEY") or (
-        _gemini_client is None and _gemini_model is None
-    ):
-        return None
-    prompt = f"""
-    Analyze this intel report: "{raw_text}"
-    Source: {source_type}
-    1. Translate to professional Hebrew (military context).
-    2. Extract city/region and provide approximate Lat/Lng in Israel/Middle East.
-    3. Categorize: 'תקיפה', 'תנועת כוחות', 'התרעה'.
-    4. Rate reliability (0-1) based on source.
-    Return ONLY JSON: {{"text": "...", "lat": 0.0, "lng": 0.0, "type": "...", "reliability": 0.0}}
-    """
-    try:
-        if _gemini_client is not None:
-            response = await asyncio.to_thread(
-                _gemini_client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-        else:
-            response = await asyncio.to_thread(_gemini_model.generate_content, prompt)
-        text = (getattr(response, "text", None) or "").strip()
-        data = json.loads(text.replace("```json", "").replace("```", ""))
-        if not is_within_israel(data.get("lat", 0), data.get("lng", 0)):
-            data["lat"] = 31.0461
-            data["lng"] = 34.8516
-        data["id"] = str(time.time())
-        data["timestamp"] = time.time()
-        return data
-    except Exception as e:
-        print(f"Error processing intel: {e}")
-        return None
-
-# ==========================================
 # 📡 ניהול תקשורת בזמן אמת (WebSockets)
 # ==========================================
 class ConnectionManager:
@@ -403,7 +315,6 @@ manager = ConnectionManager()
 # 🚀 יצירת האפליקציה (חייב לפני כל decorator)
 # ==========================================
 async def _lifespan(app):
-    asyncio.create_task(start_osint_pipeline())
     asyncio.create_task(fetch_homefront_command_alerts())
     yield
 
@@ -497,6 +408,7 @@ async def fetch_homefront_command_alerts():
                                                 area_event = {
                                                     "id": f"oref_area_{alert_id}",
                                                     "alert_id": alert_id,
+                                                    "cat": threat_code,
                                                     "text": f"⚠️ התראה אזורית\n{threat_info['type']} - " + ", ".join(p["city"] for p in area_points),
                                                     "lat": center_lat,
                                                     "lng": center_lng,
@@ -520,6 +432,7 @@ async def fetch_homefront_command_alerts():
                                                 event = {
                                                     "id": f"oref_{alert_id}_{city}",
                                                     "alert_id": alert_id,
+                                                    "cat": threat_code,
                                                     "text": f"🚨 פיקוד העורף\n{threat_info['type']} - {city}\n{datetime.fromtimestamp(alert.get('time', time.time())).strftime('%H:%M:%S')}",
                                                     "lat": lat,
                                                     "lng": lng,
@@ -590,7 +503,8 @@ async def fetch_homefront_command_alerts():
                                         area_event = {
                                             "id": f"tzevaadom_area_{alert_id}",
                                             "alert_id": alert_id,
-                                            "text": f"⚠️ פיקוד העורף (פרוקסי)\n{threat_info['type']} - " + ", ".join(p["city"] for p in area_points),
+                                            "cat": threat_code,
+                                            "text": f"⚠️ פיקוד העורף\n{threat_info['type']} - " + ", ".join(p["city"] for p in area_points),
                                             "lat": center_lat,
                                             "lng": center_lng,
                                             "type": threat_info['type'],
@@ -612,14 +526,15 @@ async def fetch_homefront_command_alerts():
                                         event = {
                                             "id": f"tzevaadom_{alert_id}_{city}",
                                             "alert_id": alert_id,
-                                            "text": f"🚨 פיקוד העורף (פרוקסי)\n{threat_info['type']} - {city}\n{datetime.now().strftime('%H:%M:%S')}",
+                                            "cat": threat_code,
+                                            "text": f"🚨 פיקוד העורף\n{threat_info['type']} - {city}\n{datetime.now().strftime('%H:%M:%S')}",
                                             "lat": lat,
                                             "lng": lng,
                                             "type": threat_info['type'],
                                             "color": threat_info['color'],
                                             "reliability": 0.95,
                                             "timestamp": time.time(),
-                                            "source": "פיקוד העורף (פרוקסי)",
+                                            "source": "פיקוד העורף",
                                             "polygon": get_area_polygon([city]),
                                         }
                                         add_to_history(event)
@@ -632,142 +547,6 @@ async def fetch_homefront_command_alerts():
             print(f"שגיאה כללית: {e}")
 
         await asyncio.sleep(1)
-
-# ==========================================
-# 🔁 OSINT Pipeline
-# ==========================================
-async def start_osint_pipeline():
-    seen_urls: set = set()
-    backoff_s = 15
-    israel_target = ("ישראל (מרכז)", 32.0853, 34.7818)
-    country_centroids = {
-        "Israel": (31.0461, 34.8516), "Lebanon": (33.8547, 35.8623),
-        "Syria": (34.8021, 38.9968), "Iran": (32.4279, 53.6880),
-        "Iraq": (33.2232, 43.6793), "Yemen": (15.5527, 48.5164),
-        "Jordan": (30.5852, 36.2384), "Egypt": (26.8206, 30.8025),
-        "Turkey": (38.9637, 35.2433), "Russia": (61.5240, 105.3188),
-        "United States": (37.0902, -95.7129), "United Kingdom": (55.3781, -3.4360),
-        "France": (46.2276, 2.2137), "Germany": (51.1657, 10.4515),
-        "Saudi Arabia": (23.8859, 45.0792), "Cyprus": (35.1264, 33.4299),
-    }
-
-    def gdelt_url(query, timespan="30m", maxrecords=25):
-        params = {"query": query, "mode": "ArtList", "format": "json",
-                  "maxrecords": str(maxrecords), "timespan": timespan, "sort": "datedesc"}
-        return "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
-
-    def fetch_json(url):
-        req = urllib.request.Request(url, headers={"User-Agent": "warroom/1.0"}, method="GET")
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-
-    def score_israel_alert(text):
-        t = (text or "").lower()
-        score = 0
-        hits = []
-        israel_tokens = ["israel", "tel aviv", "jerusalem", "galilee", "haifa", "beersheba", "israeli",
-                         "גוש דן", "תל אביב", "ירושלים", "חיפה", "באר שבע", "ישראל"]
-        if any(tok in t for tok in israel_tokens):
-            score += 3
-            hits.append("israel_mention")
-        else:
-            return (0, hits)
-        strong = [
-            ("air raid siren", 5), ("siren", 4), ("red alert", 6), ("rocket", 5),
-            ("missile", 6), ("ballistic", 5), ("drone", 5), ("uav", 5),
-            ("interception", 4), ("iron dome", 6), ("launch", 3), ("strike", 2),
-            ("attack", 2), ("כטב", 6), ("טיל", 6), ("רקטה", 6), ("אזעקה", 7),
-            ("צבע אדום", 8), ("יירוט", 6), ("כיפת ברזל", 7), ("שיגור", 7)
-        ]
-        for tok, pts in strong:
-            if tok in t:
-                score += pts
-                hits.append(tok)
-        weak_context = ["election", "minister", "diplomacy", "economy", "stock", "analysis", "opinion"]
-        if any(tok in t for tok in weak_context):
-            score -= 3
-        return (max(score, 0), hits)
-
-    def reliability_for_source(domain, source_country, score):
-        base = 0.35
-        if score >= 14: base = 0.75
-        elif score >= 10: base = 0.6
-        elif score >= 7: base = 0.5
-        if source_country in {"Israel", "United States", "United Kingdom"}: base += 0.05
-        if domain.endswith(".gov") or domain.endswith(".mil"): base += 0.1
-        return float(max(0.1, min(base, 0.95)))
-
-    q = '(rocket OR missile OR drone OR UAV OR "air raid" OR siren OR "red alert" OR interception OR "iron dome" OR launch OR "air defense") AND (Israel OR Israeli OR "Tel Aviv" OR Jerusalem OR Galilee OR Haifa)'
-
-    while True:
-        try:
-            url = gdelt_url(q, timespan="30m", maxrecords=50)
-            data = await asyncio.to_thread(fetch_json, url)
-            articles = data.get("articles") or []
-            backoff_s = 15
-        except urllib.error.HTTPError as e:
-            if getattr(e, "code", None) == 429:
-                wait_s = min(backoff_s, 10 * 60)
-                await asyncio.sleep(wait_s)
-                backoff_s = min(max(backoff_s * 2, 30), 10 * 60)
-                continue
-            await asyncio.sleep(min(backoff_s, 120))
-            backoff_s = min(max(backoff_s * 2, 30), 10 * 60)
-            continue
-        except Exception as e:
-            print(f"GDELT error: {e}")
-            await asyncio.sleep(min(backoff_s, 120))
-            backoff_s = min(max(backoff_s * 2, 30), 10 * 60)
-            continue
-
-        new_items = []
-        for a in articles:
-            a_url = (a.get("url") or "").strip()
-            if not a_url or a_url in seen_urls:
-                continue
-            seen_urls.add(a_url)
-            new_items.append(a)
-
-        for a in reversed(new_items):
-            title = (a.get("title") or "").strip()
-            domain = (a.get("domain") or "").strip()
-            source_country = (a.get("sourcecountry") or "").strip()
-            seen_date = (a.get("seendate") or "").strip()
-            language = (a.get("language") or "").strip()
-            o_lat, o_lng = country_centroids.get(source_country, (31.0461, 34.8516))
-            _, t_lat, t_lng = israel_target
-            intel_data = None
-            if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_KEY":
-                intel_data = await process_raw_intel(title, "GDELT")
-            if intel_data and intel_data.get("lat") and intel_data.get("lng"):
-                if is_within_israel(intel_data["lat"], intel_data["lng"]):
-                    t_lat, t_lng = intel_data["lat"], intel_data["lng"]
-            else:
-                city_coords = extract_city_from_text(title)
-                if city_coords:
-                    t_lat, t_lng = city_coords
-            text = f"{title}\n{domain} | {source_country} | {language} | {seen_date}\n{a_url}".strip()
-            score, hits = score_israel_alert(title)
-            if score < 10:
-                continue
-            event = {
-                "id": str(time.time()),
-                "text": text,
-                "lat": t_lat,
-                "lng": t_lng,
-                "type": "אזעקה/שיגור (OSINT)",
-                "reliability": reliability_for_source(domain, source_country, score),
-                "timestamp": time.time(),
-                "origin_lat": o_lat,
-                "origin_lng": o_lng,
-                "target_lat": t_lat,
-                "target_lng": t_lng,
-                "source": "OSINT",
-            }
-            add_to_history(event)
-            await manager.broadcast(event)
-
-        await asyncio.sleep(90)
 
 # ==========================================
 # 🗺️ ממשק המשתמש
@@ -873,25 +652,22 @@ async def get():
 
         /* ─── History Button ─── */
         #history-btn {{
-            position: absolute;
-            bottom: 90px; left: 10px;
-            z-index: 20;
-            background: rgba(15,23,42,0.92);
-            border: 1px solid #334155;
-            border-radius: 10px;
+            width: calc(100% - 0px);
+            background: rgba(14,165,233,0.08);
+            border: 1px solid rgba(14,165,233,0.25);
+            border-radius: 8px;
             padding: 8px 12px;
             cursor: pointer;
-            backdrop-filter: blur(8px);
-            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
-            color: #cbd5e1;
+            color: #7dd3fc;
             font-size: 12px;
             font-family: 'Assistant', sans-serif;
             display: flex;
             align-items: center;
             gap: 6px;
             transition: all 0.2s;
+            margin-top: 8px;
         }}
-        #history-btn:hover {{ background: #1e293b; color: #f0f9ff; border-color: #0ea5e9; }}
+        #history-btn:hover {{ background: rgba(14,165,233,0.15); color: #f0f9ff; border-color: #0ea5e9; }}
         #history-btn .badge {{
             background: #0ea5e9;
             color: #fff;
@@ -899,23 +675,22 @@ async def get():
             padding: 1px 6px;
             font-size: 10px;
             font-weight: 700;
+            margin-right: auto;
         }}
 
         /* ─── History Panel ─── */
         #history-panel {{
-            position: absolute;
-            bottom: 135px; left: 10px;
-            z-index: 30;
-            width: 320px;
-            max-height: 400px;
+            position: relative;
+            z-index: 5;
+            width: 100%;
+            max-height: 340px;
             overflow-y: auto;
-            background: rgba(10,18,35,0.97);
-            border: 1px solid #334155;
-            border-radius: 12px;
-            backdrop-filter: blur(12px);
-            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            background: rgba(10,18,35,0.6);
+            border: 1px solid #1e3a5f;
+            border-radius: 8px;
             display: none;
-            padding: 10px;
+            padding: 8px;
+            margin-top: 6px;
         }}
         #history-panel h3 {{
             color: #0ea5e9;
@@ -984,6 +759,22 @@ async def get():
             <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse inline-block"></span>
             <span>מחובר ופעיל</span>
         </div>
+        <!-- כפתור היסטוריה מתחת לשעון -->
+        <button id="history-btn" onclick="toggleHistory()">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+            אזעקות 24 שעות
+            <span class="badge" id="history-count">0</span>
+        </button>
+        <!-- פאנל היסטוריה נפתח מתחת -->
+        <div id="history-panel">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding-bottom:5px;border-bottom:1px solid #1e3a5f;">
+                <span style="color:#0ea5e9;font-size:12px;font-weight:700;">📋 היסטוריית 24 שעות</span>
+                <button onclick="toggleHistory()" style="color:#64748b;font-size:15px;background:none;border:none;cursor:pointer;line-height:1;">✕</button>
+            </div>
+            <div id="history-list"></div>
+        </div>
     </div>
     <div id="event-list" class="pb-20"></div>
 </div>
@@ -1002,24 +793,6 @@ async def get():
     <button data-style="satellite">לוויין</button>
     <button data-style="topo">טופוגרפי</button>
     <button data-style="outdoor">שטח</button>
-</div>
-
-<!-- ─── History Button ─── -->
-<button id="history-btn" onclick="toggleHistory()">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
-    </svg>
-    אזעקות 24 שעות
-    <span class="badge" id="history-count">0</span>
-</button>
-
-<!-- ─── History Panel ─── -->
-<div id="history-panel">
-    <h3>
-        <span>📋 היסטוריית 24 שעות</span>
-        <button onclick="toggleHistory()" style="color:#64748b;font-size:16px;background:none;border:none;cursor:pointer;">✕</button>
-    </h3>
-    <div id="history-list"></div>
 </div>
 
 <!-- ─── Legend ─── -->
@@ -1101,39 +874,25 @@ document.querySelectorAll('#map-style-switcher button').forEach(btn => {{
     }});
 }});
 
-// שמירת פולינים/קווים לאחר שינוי סגנון
+// שמירת פוליגונים לאחר שינוי סגנון
 const persistedSources = {{}};
 const persistedLayers  = [];
-const lineFeatures     = [];
 
 function restoreMapLayers() {{
-    // שחזור מקורות
     for (const [id, data] of Object.entries(persistedSources)) {{
         if (!map.getSource(id)) {{
             map.addSource(id, {{ type: 'geojson', data }});
         }}
     }}
-    // שחזור שכבות
     for (const layerSpec of persistedLayers) {{
         if (!map.getLayer(layerSpec.id)) {{
             try {{ map.addLayer(layerSpec); }} catch(e) {{}}
         }}
     }}
-    // שחזור קווי OSINT
-    initLinesSource();
-}}
-
-function initLinesSource() {{
-    if (!map.getSource('alert-lines')) {{
-        map.addSource('alert-lines', {{ type: 'geojson', data: {{ type: 'FeatureCollection', features: lineFeatures }} }});
-        map.addLayer({{ id:'alert-lines-glow', type:'line', source:'alert-lines', paint:{{'line-color':['coalesce',['get','color'],'#ef4444'],'line-opacity':0.25,'line-width':8}} }});
-        map.addLayer({{ id:'alert-lines-layer', type:'line', source:'alert-lines', layout:{{'line-cap':'round','line-join':'round'}}, paint:{{'line-color':['coalesce',['get','color'],'#ef4444'],'line-opacity':0.9,'line-width':2.5,'line-dasharray':[2,2]}} }});
-    }}
 }}
 
 map.on('load', () => {{
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
-    initLinesSource();
 }});
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1299,22 +1058,15 @@ function addEventToUI(data) {{
         .addTo(map);
     markerMap[data.id] = marker;
 
-    // ─── Polygon — רק עבור התראות פיקוד העורף (לא OSINT) ───
-    const isOrefAlert = data.source && (data.source.includes("פיקוד העורף") || data.source.includes("oref"));
-    if (isOrefAlert && data.polygon) {{
+    // ─── Polygon — רק עבור התראות מקדימות (לא צבע אדום רגיל) ───
+    const isOrefAlert = data.source && data.source.includes("פיקוד העורף");
+    // cat=0 = צבע אדום, כל השאר = התראה מקדימה (כלי טיס, מחבלים, רעידה, חומרים, צונאמי, בל"ק)
+    const cat = data.cat != null ? Number(data.cat) : -1;
+    const catFromType = (data.type||'').includes('צבע אדום') ? 0 : 1;
+    const resolvedCat = cat >= 0 ? cat : catFromType;
+    const isPreAlert = isOrefAlert && resolvedCat !== 0;
+    if (isPreAlert && data.polygon) {{
         addPolygonToMap(data.id, data.polygon, color);
-    }}
-
-    // ─── OSINT trajectory line ───
-    if (data.source === "OSINT" && data.origin_lat != null && data.target_lat != null) {{
-        lineFeatures.unshift({{
-            type: "Feature",
-            properties: {{ color }},
-            geometry: {{ type: "LineString", coordinates: [[data.origin_lng, data.origin_lat],[data.target_lng, data.target_lat]] }}
-        }});
-        if (lineFeatures.length > 50) lineFeatures.length = 50;
-        const src = map.getSource('alert-lines');
-        if (src) src.setData({{ type: "FeatureCollection", features: lineFeatures }});
     }}
 
     map.flyTo({{ center: [data.lng, data.lat], zoom: 9, speed: 0.8 }});
