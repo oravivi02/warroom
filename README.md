@@ -410,6 +410,7 @@ async def fetch_homefront_command_alerts():
 
                                             # זיהוי מקור לפי סוג איום
                                             THREAT_ORIGINS = {
+                                                0: {"name": "איראן/לבנון", "lat": 33.8547, "lng": 35.8623},  # צבע אדום בליסטי — ברירת מחדל לבנון
                                                 7: {"name": "איראן", "lat": 32.4279, "lng": 53.6880},
                                                 1: {"name": "לבנון", "lat": 33.8547, "lng": 35.8623},
                                                 2: {"name": "עזה",   "lat": 31.3547, "lng": 34.3088},
@@ -417,10 +418,15 @@ async def fetch_homefront_command_alerts():
                                             }
                                             origin = THREAT_ORIGINS.get(threat_code)
 
+                                            # עיגולים לכל עיר בנפרד (רדיוס ~5 ק"מ)
+                                            city_circles = [
+                                                {"city": p["city"], "lat": p["lat"], "lng": p["lng"], "radius": 0.06}
+                                                for p in area_points
+                                            ]
+
                                             if area_points:
                                                 center_lat = sum(p["lat"] for p in area_points) / len(area_points)
                                                 center_lng = sum(p["lng"] for p in area_points) / len(area_points)
-                                                # ── התראה אחת בלבד עם כל הערים ──
                                                 area_event = {
                                                     "id": f"oref_{alert_id}",
                                                     "alert_id": alert_id,
@@ -434,11 +440,7 @@ async def fetch_homefront_command_alerts():
                                                     "timestamp": alert.get('time', time.time()),
                                                     "source": "פיקוד העורף",
                                                     "area": area_points,
-                                                    "polygon": polygon,
-                                                    "city_polygons": [
-                                                        {"city": p["city"], "lat": p["lat"], "lng": p["lng"], "polygon": p["polygon"]}
-                                                        for p in area_points if p.get("polygon")
-                                                    ],
+                                                    "city_circles": city_circles,
                                                     "origin": origin,
                                                     "cities": [p["city"] for p in area_points],
                                                 }
@@ -490,6 +492,7 @@ async def fetch_homefront_command_alerts():
                                     threat_code = alert.get('category', 0)
                                     threat_info = THREAT_MAPPING.get(threat_code, {"type": "התרעה כללית", "color": "#ef4444"})
                                     THREAT_ORIGINS = {
+                                        0: {"name": "לבנון/עזה", "lat": 33.0, "lng": 35.5},
                                         7: {"name": "איראן", "lat": 32.4279, "lng": 53.6880},
                                         1: {"name": "לבנון", "lat": 33.8547, "lng": 35.8623},
                                         2: {"name": "עזה",   "lat": 31.3547, "lng": 34.3088},
@@ -502,13 +505,14 @@ async def fetch_homefront_command_alerts():
                                         if not raw_city:
                                             continue
                                         a_lat, a_lng = resolve_city_coordinates(raw_city)
-                                        city_poly = get_area_polygon([raw_city])
-                                        area_points.append({"city": raw_city, "lat": a_lat, "lng": a_lng, "polygon": city_poly})
-                                    polygon = get_area_polygon([p["city"] for p in area_points])
+                                        area_points.append({"city": raw_city, "lat": a_lat, "lng": a_lng})
                                     if area_points:
                                         center_lat = sum(p["lat"] for p in area_points) / len(area_points)
                                         center_lng = sum(p["lng"] for p in area_points) / len(area_points)
-                                        # ── התראה אחת בלבד ──
+                                        city_circles = [
+                                            {"city": p["city"], "lat": p["lat"], "lng": p["lng"], "radius": 0.06}
+                                            for p in area_points
+                                        ]
                                         area_event = {
                                             "id": f"oref_{alert_id}",
                                             "alert_id": alert_id,
@@ -522,11 +526,7 @@ async def fetch_homefront_command_alerts():
                                             "timestamp": time.time(),
                                             "source": "פיקוד העורף",
                                             "area": area_points,
-                                            "polygon": polygon,
-                                            "city_polygons": [
-                                                {"city": p["city"], "lat": p["lat"], "lng": p["lng"], "polygon": p["polygon"]}
-                                                for p in area_points if p.get("polygon")
-                                            ],
+                                            "city_circles": city_circles,
                                             "origin": origin,
                                             "cities": [p["city"] for p in area_points],
                                         }
@@ -941,13 +941,17 @@ function removePolygonFromMap(eventId) {{
     const ids = polygonIds[eventId];
     if (!ids) return;
     const [sourceId, fillId, borderId] = ids;
-    try {{ if (map.getLayer(fillId))    map.removeLayer(fillId);   }} catch(e) {{}}
-    try {{ if (map.getLayer(borderId))  map.removeLayer(borderId); }} catch(e) {{}}
-    try {{ if (map.getSource(sourceId)) map.removeSource(sourceId);}} catch(e) {{}}
+    try {{ if (map.getLayer(borderId)) map.removeLayer(borderId); }} catch(e) {{}}
+    try {{ if (map.getLayer(fillId))   map.removeLayer(fillId);   }} catch(e) {{}}
+    try {{ if (map.getSource(sourceId)) map.removeSource(sourceId); }} catch(e) {{}}
     delete polygonIds[eventId];
     delete persistedSources[sourceId];
-    const li = persistedLayers.findIndex(l => l.id === fillId || l.id === borderId);
-    if (li > -1) persistedLayers.splice(li, 2);
+    // מחק את שתי השכבות מהמערך בצורה בטוחה
+    for (let i = persistedLayers.length - 1; i >= 0; i--) {{
+        if (persistedLayers[i].id === fillId || persistedLayers[i].id === borderId) {{
+            persistedLayers.splice(i, 1);
+        }}
+    }}
 }}
 
 // ── עיגול (התראה מקדימה — טווח רחב) ──
@@ -990,13 +994,16 @@ function removeCircleFromMap(eventId) {{
     const ids = circleIds[eventId];
     if (!ids) return;
     const [sourceId, fillId, borderId] = ids;
-    try {{ if (map.getLayer(fillId))    map.removeLayer(fillId);   }} catch(e) {{}}
     try {{ if (map.getLayer(borderId))  map.removeLayer(borderId); }} catch(e) {{}}
+    try {{ if (map.getLayer(fillId))    map.removeLayer(fillId);   }} catch(e) {{}}
     try {{ if (map.getSource(sourceId)) map.removeSource(sourceId);}} catch(e) {{}}
     delete circleIds[eventId];
     delete persistedSources[sourceId];
-    const li = persistedLayers.findIndex(l => l.id === fillId || l.id === borderId);
-    if (li > -1) persistedLayers.splice(li, 2);
+    for (let i = persistedLayers.length - 1; i >= 0; i--) {{
+        if (persistedLayers[i].id === fillId || persistedLayers[i].id === borderId) {{
+            persistedLayers.splice(i, 1);
+        }}
+    }}
 }}
 
 // ── מרקר ──
@@ -1021,22 +1028,23 @@ ws.onmessage = (event) => {{
 
     // ── מחיקת אזעקות שנסתיימו ──
     if (data.action === "remove_alert") {{
-        (data.ids_to_remove || []).forEach(id => {{
+        const idsToClean = new Set(data.ids_to_remove || []);
+        // הוסף גם את ה-alert_id הגולמי
+        if (data.alert_id) idsToClean.add(data.alert_id);
+
+        idsToClean.forEach(id => {{
             removeMarkerFromMap(id);
             removePolygonFromMap(id);
             removeCircleFromMap(id);
             cleanupMissile(id);
-            // פוליגונים לפי עיר
-            for (let i = 0; i < 50; i++) removePolygonFromMap(`${{id}}_c${{i}}`);
+            // עיגולי ערים (_cc0, _cc1 ...) + טילים (_m0, _m1 ...)
+            for (let i = 0; i < 100; i++) {{
+                removePolygonFromMap(`${{id}}_cc${{i}}`);
+                cleanupMissile(`${{id}}_m${{i}}`);
+            }}
             const card = document.getElementById(`card-${{id}}`);
             if (card) {{ card.classList.add('removing'); setTimeout(() => card.remove(), 650); }}
         }});
-        if (data.alert_id) {{
-            removePolygonFromMap(data.alert_id);
-            removeCircleFromMap(data.alert_id);
-            removeMarkerFromMap(data.alert_id);
-            cleanupMissile(data.alert_id);
-        }}
         // ── העבר לארכיון היסטוריה ──
         if (data.archived_event) {{
             const ae = data.archived_event;
@@ -1127,30 +1135,28 @@ function addEventToUI(data) {{
     const isRedAlert  = isOref && cat === 0;
     const isPreAlert  = isOref && cat !== 0;
 
-    // ── צבע אדום: פוליגון נפרד לכל עיר ──
-    if (isRedAlert) {{
-        const cityPolys = data.city_polygons || [];
-        if (cityPolys.length > 0) {{
-            // פוליגון נפרד לכל עיר
-            cityPolys.forEach((cp, idx) => {{
-                if (cp.polygon) {{
-                    addPolygonToMap(`${{data.id}}_c${{idx}}`, cp.polygon, color);
-                }}
-            }});
-        }} else if (data.polygon) {{
-            // fallback — פוליגון אחד
-            addPolygonToMap(data.id, data.polygon, color);
-        }}
+    // ── עיגולים קטנים לכל עיר (במקום פוליגון ענק) ──
+    const cityCircles = data.city_circles || [];
+    if (cityCircles.length > 0) {{
+        cityCircles.forEach((cc, idx) => {{
+            addCityCircle(`${{data.id}}_cc${{idx}}`, cc.lat, cc.lng, cc.radius || 0.06, color);
+        }});
     }}
 
-    // ── התראה מקדימה: עיגול נרחב ──
+    // ── עיגול נרחב רק להתראות מקדימות (כלי טיס / בל"ק) ──
     if (isPreAlert) {{
         addCircleToMap(data.id, data.lat, data.lng, color);
     }}
 
-    // ── אנימציית טיל חי — אם יש מקור ──
+    // ── אנימציית טיל — לכל התראה שיש לה מקור ──
     if (data.origin && isOref) {{
-        animateMissile(data.id, data.origin, {{lat: data.lat, lng: data.lng}}, color, cat);
+        // טיל נפרד לכל עיר ביעד
+        const targets = cityCircles.length > 0
+            ? cityCircles.map(cc => ({{ lat: cc.lat, lng: cc.lng }}))
+            : [{{ lat: data.lat, lng: data.lng }}];
+        targets.forEach((tgt, idx) => {{
+            animateMissile(`${{data.id}}_m${{idx}}`, data.origin, tgt, color, cat);
+        }});
     }}
 
     map.flyTo({{ center: [data.lng, data.lat], zoom: cat === 0 ? 9 : 7, speed: 0.8 }});
@@ -1159,143 +1165,162 @@ function addEventToUI(data) {{
 // ─────────────────────────────────────────────────────────────────────────────
 // 🚀 אנימציית טיל חי
 // ─────────────────────────────────────────────────────────────────────────────
-const missileAnimations = {{}};  // id -> {{sourceId, layerIds, rafId}}
+const missileAnimations = {{}};
+
+// ── עיגול קטן לעיר בודדת (~5 ק"מ רדיוס) ──
+function addCityCircle(id, lat, lng, r, color) {{
+    const steps = 48;
+    const coords = [];
+    for (let i = 0; i <= steps; i++) {{
+        const a = (i / steps) * 2 * Math.PI;
+        coords.push([lng + r * Math.cos(a), lat + r * Math.sin(a) * 0.85]);
+    }}
+    const geo = {{ type:'FeatureCollection', features:[{{
+        type:'Feature', properties:{{}},
+        geometry:{{ type:'Polygon', coordinates:[coords] }}
+    }}]}};
+    const srcId = `cc-src-${{id}}`;
+    const fillId = `cc-fill-${{id}}`;
+    const bordId = `cc-bord-${{id}}`;
+    persistedSources[srcId] = geo;
+    if (!map.getSource(srcId)) map.addSource(srcId, {{type:'geojson', data:geo}});
+    if (!map.getLayer(fillId)) {{
+        const spec = {{id:fillId, type:'fill', source:srcId, paint:{{'fill-color':color,'fill-opacity':0.25}}}};
+        map.addLayer(spec); persistedLayers.push(spec);
+    }}
+    if (!map.getLayer(bordId)) {{
+        const spec = {{id:bordId, type:'line', source:srcId, paint:{{'line-color':color,'line-width':2,'line-opacity':0.95}}}};
+        map.addLayer(spec); persistedLayers.push(spec);
+    }}
+    // שמור ב-polygonIds כדי שיימחק עם removePolygonFromMap
+    polygonIds[id] = [srcId, fillId, bordId];
+}}
 
 function animateMissile(eventId, origin, target, color, cat) {{
-    const srcLine   = `msrc-line-${{eventId}}`;
-    const srcHead   = `msrc-head-${{eventId}}`;
-    const srcTrail  = `msrc-trail-${{eventId}}`;
-    const layLine   = `ml-line-${{eventId}}`;
-    const layGlow   = `ml-glow-${{eventId}}`;
-    const layHead   = `ml-head-${{eventId}}`;
-    const layTrail  = `ml-trail-${{eventId}}`;
+    // זמן טיסה ריאלי לפי מרחק ומקור
+    const distKm = Math.sqrt(
+        Math.pow((origin.lat - target.lat) * 111, 2) +
+        Math.pow((origin.lng - target.lng) * 111 * Math.cos(target.lat * Math.PI/180), 2)
+    );
+    // ~2 ק"מ/שנ לטיל קרוב, ~4 ק"מ/שנ בליסטי
+    const speedKmS = cat === 7 ? 4.0 : (distKm > 200 ? 3.5 : 2.0);
+    const travelMs = Math.max(8000, Math.min((distKm / speedKmS) * 1000, 120000));
 
-    // travel time: ~90s איראן, ~30s לבנון/עזה
-    const travelMs  = cat === 7 ? 90000 : (cat === 2 ? 20000 : 35000);
-    const startTime = Date.now();
+    const srcLine  = `msl-${{eventId}}`;
+    const srcHead  = `msh-${{eventId}}`;
+    const layGlow  = `mlg-${{eventId}}`;
+    const layLine  = `mll-${{eventId}}`;
+    const layHead  = `mlh-${{eventId}}`;
+    const layDot   = `mld-${{eventId}}`;
 
-    // GeoJSON ריקניים
-    const emptyFC   = {{ type:'FeatureCollection', features:[] }};
+    const emptyFC = {{type:'FeatureCollection',features:[]}};
+    if (!map.getSource(srcLine)) map.addSource(srcLine, {{type:'geojson',data:emptyFC}});
+    if (!map.getSource(srcHead)) map.addSource(srcHead, {{type:'geojson',data:emptyFC}});
 
-    if (!map.getSource(srcLine)) {{
-        map.addSource(srcLine,  {{ type:'geojson', data: emptyFC }});
-        map.addSource(srcHead,  {{ type:'geojson', data: emptyFC }});
-        map.addSource(srcTrail, {{ type:'geojson', data: emptyFC }});
-    }}
-
-    // שכבת זוהר
-    if (!map.getLayer(layGlow)) {{
-        map.addLayer({{ id: layGlow, type:'line', source: srcLine,
-            paint: {{ 'line-color': color, 'line-opacity': 0.25, 'line-width': 10, 'line-blur': 6 }} }});
-    }}
-    // שכבת קו ראשי
-    if (!map.getLayer(layLine)) {{
-        map.addLayer({{ id: layLine, type:'line', source: srcLine,
-            layout: {{ 'line-cap':'round' }},
-            paint: {{ 'line-color': color, 'line-opacity': 0.9, 'line-width': 2.5 }} }});
-    }}
-    // טריל
-    if (!map.getLayer(layTrail)) {{
-        map.addLayer({{ id: layTrail, type:'line', source: srcTrail,
-            paint: {{ 'line-color': '#ffffff', 'line-opacity': 0.5, 'line-width': 1.5,
-                      'line-dasharray': [2,4] }} }});
-    }}
+    // זוהר
+    if (!map.getLayer(layGlow)) map.addLayer({{
+        id:layGlow, type:'line', source:srcLine,
+        paint:{{'line-color':color,'line-opacity':0.2,'line-width':12,'line-blur':8}}
+    }});
+    // קו ראשי
+    if (!map.getLayer(layLine)) map.addLayer({{
+        id:layLine, type:'line', source:srcLine,
+        layout:{{'line-cap':'round'}},
+        paint:{{'line-color':color,'line-opacity':0.85,'line-width':2}}
+    }});
+    // טריל לבן מקווקו
+    if (!map.getLayer(layDot)) map.addLayer({{
+        id:layDot, type:'line', source:srcLine,
+        paint:{{'line-color':'#fff','line-opacity':0.4,'line-width':1,'line-dasharray':[2,5]}}
+    }});
     // ראש הטיל
-    if (!map.getLayer(layHead)) {{
-        map.addLayer({{ id: layHead, type:'circle', source: srcHead,
-            paint: {{ 'circle-radius': 6, 'circle-color': '#ffffff',
-                      'circle-stroke-color': color, 'circle-stroke-width': 2,
-                      'circle-opacity': 1 }} }});
+    if (!map.getLayer(layHead)) map.addLayer({{
+        id:layHead, type:'circle', source:srcHead,
+        paint:{{'circle-radius':5,'circle-color':'#fff','circle-stroke-color':color,'circle-stroke-width':2}}
+    }});
+
+    // בניית קשת (arc) — גובה מקסימלי לפי מרחק
+    function buildArc(o, t, progress) {{
+        const pts = [];
+        const arcHeight = Math.min(distKm * 0.15, 8);  // גובה יחסי בגרעות
+        const steps = Math.max(30, Math.floor(progress * 60));
+        for (let i = 0; i <= steps; i++) {{
+            const f = i / steps * progress;
+            const lng = o.lng + (t.lng - o.lng) * f;
+            const lat = o.lat + (t.lat - o.lat) * f;
+            // קשת פרבולית
+            const h = arcHeight * 4 * f * (1 - f);
+            pts.push([lng, lat + h]);
+        }}
+        return pts;
     }}
 
-    function lerp(a, b, t) {{ return a + (b - a) * t; }}
-    function easeIn(t) {{ return t * t; }}
+    const startTime = Date.now();
 
     function frame() {{
         const elapsed = Date.now() - startTime;
         const t = Math.min(elapsed / travelMs, 1.0);
-        const te = easeIn(t);
+        // easeInOut
+        const te = t < 0.5 ? 2*t*t : -1+(4-2*t)*t;
 
-        const curLng = lerp(origin.lng, target.lng, te);
-        const curLat = lerp(origin.lat, target.lat, te);
+        const arcPts = buildArc(origin, target, te);
+        const cur = arcPts[arcPts.length - 1];
 
-        // קו מהמוצא למיקום נוכחי
-        const lineFC = {{ type:'FeatureCollection', features: [{{
-            type:'Feature', geometry: {{ type:'LineString',
-                coordinates: [[origin.lng, origin.lat], [curLng, curLat]] }}
+        const lineFC = {{type:'FeatureCollection',features:[{{
+            type:'Feature',
+            geometry:{{type:'LineString', coordinates:arcPts}}
         }}]}};
-        // טריל (40% אחרון)
-        const trailT = Math.max(0, te - 0.4);
-        const trailLng = lerp(origin.lng, target.lng, easeIn(trailT));
-        const trailLat = lerp(origin.lat, target.lat, easeIn(trailT));
-        const trailFC = {{ type:'FeatureCollection', features: [{{
-            type:'Feature', geometry: {{ type:'LineString',
-                coordinates: [[trailLng, trailLat], [curLng, curLat]] }}
-        }}]}};
-        // נקודת ראש
-        const headFC = {{ type:'FeatureCollection', features: [{{
-            type:'Feature', geometry: {{ type:'Point', coordinates: [curLng, curLat] }}
+        const headFC = {{type:'FeatureCollection',features:[{{
+            type:'Feature',
+            geometry:{{type:'Point', coordinates:cur}}
         }}]}};
 
         try {{
-            if (map.getSource(srcLine))  map.getSource(srcLine).setData(lineFC);
-            if (map.getSource(srcTrail)) map.getSource(srcTrail).setData(trailFC);
-            if (map.getSource(srcHead))  map.getSource(srcHead).setData(headFC);
+            if (map.getSource(srcLine)) map.getSource(srcLine).setData(lineFC);
+            if (map.getSource(srcHead)) map.getSource(srcHead).setData(headFC);
         }} catch(e) {{}}
 
         if (t < 1.0) {{
             const rafId = requestAnimationFrame(frame);
             if (missileAnimations[eventId]) missileAnimations[eventId].rafId = rafId;
         }} else {{
-            // פגיעה — אפקט התפוצצות
             showImpact(target.lng, target.lat, color, eventId);
             cleanupMissile(eventId);
         }}
     }}
 
-    missileAnimations[eventId] = {{ srcLine, srcHead, srcTrail, layLine, layGlow, layHead, layTrail, rafId: null }};
-    const rafId = requestAnimationFrame(frame);
-    missileAnimations[eventId].rafId = rafId;
+    missileAnimations[eventId] = {{srcLine, srcHead, layGlow, layLine, layHead, layDot, rafId:null}};
+    missileAnimations[eventId].rafId = requestAnimationFrame(frame);
 }}
 
 function cleanupMissile(eventId) {{
     const m = missileAnimations[eventId];
     if (!m) return;
     if (m.rafId) cancelAnimationFrame(m.rafId);
-    [m.layLine, m.layGlow, m.layHead, m.layTrail].forEach(l => {{
+    [m.layGlow, m.layLine, m.layHead, m.layDot].forEach(l => {{
         try {{ if (map.getLayer(l)) map.removeLayer(l); }} catch(e) {{}}
     }});
-    [m.srcLine, m.srcHead, m.srcTrail].forEach(s => {{
+    [m.srcLine, m.srcHead].forEach(s => {{
         try {{ if (map.getSource(s)) map.removeSource(s); }} catch(e) {{}}
     }});
     delete missileAnimations[eventId];
 }}
 
-// ── אפקט פגיעה ──
 function showImpact(lng, lat, color, eventId) {{
-    const srcId = `impact-src-${{eventId}}`;
-    const layId = `impact-lay-${{eventId}}`;
-    const fc = {{ type:'FeatureCollection', features:[{{
-        type:'Feature', geometry:{{ type:'Point', coordinates:[lng,lat] }}
-    }}]}};
+    const srcId = `imp-src-${{eventId}}`;
+    const layId = `imp-lay-${{eventId}}`;
+    const fc = {{type:'FeatureCollection',features:[{{type:'Feature',geometry:{{type:'Point',coordinates:[lng,lat]}}}}]}};
     try {{
-        if (!map.getSource(srcId)) map.addSource(srcId, {{ type:'geojson', data:fc }});
-        if (!map.getLayer(layId)) {{
-            map.addLayer({{ id: layId, type:'circle', source: srcId, paint: {{
-                'circle-radius': 4,
-                'circle-color': color,
-                'circle-opacity': 1,
-                'circle-stroke-color': '#fff',
-                'circle-stroke-width': 2,
-            }} }});
-        }}
-        // אנימציית התפשטות
-        let r = 4, op = 1;
+        if (!map.getSource(srcId)) map.addSource(srcId, {{type:'geojson',data:fc}});
+        if (!map.getLayer(layId)) map.addLayer({{id:layId,type:'circle',source:srcId,
+            paint:{{'circle-radius':4,'circle-color':color,'circle-opacity':1,'circle-stroke-color':'#fff','circle-stroke-width':2}}
+        }});
+        let r=4, op=1;
         const expand = () => {{
-            r += 3; op -= 0.07;
+            r += 4; op -= 0.06;
             try {{
-                map.setPaintProperty(layId, 'circle-radius', r);
-                map.setPaintProperty(layId, 'circle-opacity', Math.max(0, op));
+                map.setPaintProperty(layId,'circle-radius',r);
+                map.setPaintProperty(layId,'circle-opacity',Math.max(0,op));
             }} catch(e) {{ return; }}
             if (op > 0) requestAnimationFrame(expand);
             else {{
